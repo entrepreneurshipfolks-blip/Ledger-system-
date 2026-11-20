@@ -24,7 +24,7 @@ function blank(){
     students: [], payments: [], charges: [], notes: [], log: [],
     ledger: [], // {id,sc,tid,type:'expense'|'income',title,amount,date,by,ts,voided}
     photos: {},
-    settings: { colors:{}, look:{}, lastBackup:null, style:'ocean', rates:{UGX:1} },
+    settings: { colors:{}, look:{}, lastBackup:null, style:'ocean', rates:{UGX:1}, syncCode:null },
     security: { attempts:{} },
     session: null, // {role:'admin'|'bursar'|'inspector', id, sc}
     remember: null // same shape as session, used for "remember this device"
@@ -35,9 +35,10 @@ function load(){
   if(!DATA || typeof DATA!=='object') DATA = blank();
   ['schools','students','payments','charges','notes','log','bursars','inspectors','ledger','staff','activities','actPayments'].forEach(function(k){ if(!Array.isArray(DATA[k])) DATA[k]=[]; });
   if(!DATA.photos) DATA.photos={};
-  if(!DATA.settings) DATA.settings={colors:{},look:{},lastBackup:null,style:'ocean',rates:{UGX:1},countryCode:'256'};
+  if(!DATA.settings) DATA.settings={colors:{},look:{},lastBackup:null,style:'ocean',rates:{UGX:1},countryCode:'256',syncCode:null};
   if(!DATA.settings.rates) DATA.settings.rates={UGX:1};
   if(!DATA.settings.countryCode) DATA.settings.countryCode='256';
+  if(DATA.settings.syncCode===undefined) DATA.settings.syncCode=null;
   if(!DATA.security) DATA.security={attempts:{}};
   if(!DATA.admin) DATA.admin={pinHash:null,salt:null,name:'Admin',phone:'',email:''};
   if(DATA.admin.phone===undefined) DATA.admin.phone='';
@@ -62,7 +63,133 @@ function findAccount(name){
   if(i) return {role:'inspector',obj:i};
   return null;
 }
-function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(DATA)); }catch(e){ toast('Could not save — storage may be full.'); } }
+function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(DATA)); }catch(e){ toast('Could not save — storage may be full.'); } syncSchedulePush(); }
+
+/* ------------------------------------------------------------- cloud sync */
+/* Optional real-time sync across devices, backed by a Firebase project.
+   Paste your project's config below to turn it on — leave it as null and the
+   app behaves exactly as it always has, fully offline, nothing else changes.
+   Get this object from: Firebase console → Project settings → your web app. */
+var SYNC_CONFIG = (typeof window!=='undefined' && window.__SYNC_CONFIG_OVERRIDE__) || {
+  apiKey: "AIzaSyDE_XYcKt-Zk53NQw5-SU5jwAm4N1O4pBk",
+  authDomain: "ledger-system-22d85.firebaseapp.com",
+  projectId: "ledger-system-22d85",
+  storageBucket: "ledger-system-22d85.firebasestorage.app",
+  messagingSenderId: "524987798345",
+  appId: "1:524987798345:web:ee7c54337a4465c2280098"
+};
+var SYNC_COLLECTIONS = ['schools','students','payments','charges','ledger','staff','activities','actPayments','bursars','inspectors'];
+var syncDb=null, syncUnsubs=[], syncPushTimer=null, syncApplyingRemote=false;
+var syncStatus='off'; // 'off' | 'connecting' | 'synced' | 'error'
+
+function syncAvailable(){ return !!(SYNC_CONFIG && SYNC_CONFIG.apiKey && window.firebase && firebase.firestore); }
+function syncOn(){ return syncAvailable() && !!(DATA.settings && DATA.settings.syncCode); }
+function syncCode(){ return DATA.settings && DATA.settings.syncCode; }
+
+function syncStopListening(){ syncUnsubs.forEach(function(u){ try{ u(); }catch(e){} }); syncUnsubs=[]; }
+
+function syncInit(){
+  if(!syncOn()) return;
+  try{
+    if(!firebase.apps.length) firebase.initializeApp(SYNC_CONFIG);
+    syncDb = firebase.firestore();
+  }catch(e){ syncStatus='error'; return; }
+  syncStatus='connecting';
+  syncStopListening();
+  var root = syncDb.collection('syncs').doc(syncCode());
+  SYNC_COLLECTIONS.forEach(function(name){
+    var unsub = root.collection(name).onSnapshot({includeMetadataChanges:true}, function(snap){
+      syncApplyingRemote=true;
+      var any=false;
+      snap.docChanges().forEach(function(ch){
+        if(ch.doc.metadata.hasPendingWrites) return; // our own just-written doc echoing back — skip only this one
+        any=true;
+        var arr=DATA[name]; if(!Array.isArray(arr)) return;
+        var idx=arr.findIndex(function(x){return x.id===ch.doc.id;});
+        if(ch.type==='removed'){ if(idx>-1) arr.splice(idx,1); }
+        else{ var val=ch.doc.data(); val.id=ch.doc.id; if(idx>-1) arr[idx]=val; else arr.push(val); }
+      });
+      syncApplyingRemote=false;
+      if(any){ syncStatus='synced'; save(); render(); }
+    }, function(){ syncStatus='error'; render(); });
+    syncUnsubs.push(unsub);
+  });
+  var unsubRoot = root.onSnapshot({includeMetadataChanges:true}, function(doc){
+    if(doc.metadata.hasPendingWrites || !doc.exists) return;
+    syncApplyingRemote=true;
+    var d=doc.data()||{};
+    if(d.admin) Object.assign(DATA.admin, d.admin);
+    if(d.settings){ var keepCode=DATA.settings.syncCode, keepBackup=DATA.settings.lastBackup; Object.assign(DATA.settings, d.settings); DATA.settings.syncCode=keepCode; DATA.settings.lastBackup=keepBackup; }
+    syncApplyingRemote=false; syncStatus='synced';
+    save(); render();
+  }, function(){ syncStatus='error'; render(); });
+  syncUnsubs.push(unsubRoot);
+}
+
+function syncSchedulePush(){
+  if(!syncOn() || syncApplyingRemote) return;
+  clearTimeout(syncPushTimer);
+  syncPushTimer=setTimeout(syncPushNow, 700);
+}
+function syncPushNow(){
+  if(!syncOn() || !syncDb) return;
+  var root=syncDb.collection('syncs').doc(syncCode());
+  var ops=[]; // {ref, data, merge}
+  SYNC_COLLECTIONS.forEach(function(name){
+    (DATA[name]||[]).forEach(function(item){ if(item && item.id) ops.push({ref:root.collection(name).doc(item.id), data:item}); });
+  });
+  var settingsCopy=Object.assign({},DATA.settings); delete settingsCopy.syncCode;
+  ops.push({ref:root, data:{admin:DATA.admin, settings:settingsCopy, updatedAt:Date.now()}, merge:true});
+  // Firestore batches cap at 500 writes, so a school with a lot of history is
+  // chunked into several sequential batches rather than one big one.
+  var chunks=[]; for(var i=0;i<ops.length;i+=450) chunks.push(ops.slice(i,i+450));
+  var chain=Promise.resolve();
+  chunks.forEach(function(chunk){
+    chain=chain.then(function(){
+      var batch=syncDb.batch();
+      chunk.forEach(function(o){ batch.set(o.ref, o.data, o.merge?{merge:true}:undefined); });
+      return batch.commit();
+    });
+  });
+  chain.then(function(){ syncStatus='synced'; }).catch(function(){ syncStatus='error'; });
+}
+function syncGenerateCode(){ return b2hex(crypto.getRandomValues(new Uint8Array(10))); }
+function syncEnable(){
+  if(!syncAvailable()){ toast("Cloud sync isn't set up for this copy of the app yet."); return; }
+  if(!DATA.settings.syncCode) DATA.settings.syncCode=syncGenerateCode();
+  save(); syncInit(); syncPushNow();
+}
+function syncJoin(code){
+  if(!syncAvailable()){ toast("Cloud sync isn't set up for this copy of the app yet."); return; }
+  code=(code||'').trim().toLowerCase();
+  if(!code){ toast('Enter a sync code.'); return; }
+  DATA.settings.syncCode=code; save(); syncInit();
+}
+function syncDisable(){ syncStopListening(); DATA.settings.syncCode=null; save(); syncStatus='off'; }
+function cloudSyncSectionHtml(){
+  if(!syncAvailable()) return '';
+  var on=!!syncCode();
+  var out='<div class="sect"><h3>Cloud sync</h3><div class="card">';
+  if(!on){
+    out += '<p class="mu">Off — this device only shares data with others once you turn sync on or join an existing code.</p>';
+    if(!isInspector()){
+      out += '<button class="pri" id="syncOnBtn">Turn on cloud sync</button>'+
+        '<div style="margin-top:10px"><label>Already have a sync code from someone else?</label><input id="syncJoinCode" placeholder="Paste the code here"><button id="syncJoinBtn" style="margin-top:6px">Join</button></div>';
+    }
+  } else {
+    var st={connecting:'Connecting…',synced:'Synced ✓',error:'Connection problem — will retry',off:'Off'}[syncStatus]||'Off';
+    out += '<div class="it"><span class="mu">Status</span><b>'+esc(st)+'</b></div>'+
+      '<div class="it"><span class="mu">Sync code</span><b style="font-family:monospace">'+esc(syncCode())+'</b></div>'+
+      '<p class="mu">Share this code with your other devices or staff — anyone who enters it (Settings → Cloud sync → Join) sees and edits the same live data.</p>';
+    if(!isInspector()){
+      out += '<button id="syncCopyBtn">Copy code</button> '+
+        '<a class="btn" href="https://wa.me/?text='+encodeURIComponent('Join our ledger\'s cloud sync — open the app, go to Settings → Cloud sync → Join, and enter this code: '+syncCode())+'" target="_blank">Share via WhatsApp</a> '+
+        '<a class="btn" href="sms:?body='+encodeURIComponent('Ledger cloud sync code: '+syncCode())+'">Share via SMS</a> '+
+        '<button class="dng" id="syncOffBtn" style="margin-left:8px">Turn off sync on this device</button>';
+    }
+  }
+  return out+'</div></div>';
+}
 
 /* --------------------------------------------------------- tiny password hash */
 function b2hex(buf){ return Array.prototype.map.call(new Uint8Array(buf),function(b){return b.toString(16).padStart(2,'0')}).join(''); }
@@ -417,7 +544,10 @@ function viewLanding(){
         '<div class="fm"><label>Your full name</label><input id="suName" placeholder="e.g. Grace Nakato">'+
         '<label>Choose a password (6+ characters, not something like "123456")</label><input id="suPin" type="password" placeholder="••••••">'+
         '<label>Confirm password</label><input id="suPin2" type="password" placeholder="••••••">'+
-        '<button class="pri" id="suGo" style="margin-top:14px;width:100%">Set up and continue</button></div>')+
+        '<button class="pri" id="suGo" style="margin-top:14px;width:100%">Set up and continue</button></div>'+
+        (syncAvailable()?('<p class="mu" style="text-align:center;margin-top:14px">or</p>'+
+        '<div class="fm"><label>Already part of a school\'s system elsewhere? Join it with its sync code</label><input id="suJoinCode" placeholder="Paste the sync code here">'+
+        '<button id="suJoinGo" style="width:100%;margin-top:8px">Join</button><div id="suJoinMsg" class="mu" style="margin-top:6px"></div></div>'):''))+
     '</div>'+
     '<div class="foot">Institutional Ledger System</div>'+
     '</div></div>';
@@ -958,6 +1088,7 @@ BODY.settings = function(){
     '<option value="light"'+(mode==='light'?' selected':'')+'>Light</option>'+
     '<option value="dark"'+(mode==='dark'?' selected':'')+'>Dark</option></select>'+
     '<button class="pri" id="setModeGo" style="margin-top:8px">Apply theme</button></div></div>';
+  out += cloudSyncSectionHtml();
   if(isInspector()){
     out += '<div class="card"><p class="mu">Inspectors have view-only access. Settings can only be changed by the bursar or admin.</p></div>';
     out += '<div class="sect"><h3>Contact the admin</h3><div class="card">'+contactLinksHtml(DATA.admin.phone,DATA.admin.email)+'</div></div>';
@@ -1102,7 +1233,13 @@ function wire(route,q){
   wireSwipe();
   document.querySelectorAll('[data-hist]').forEach(function(b){ b.onclick=function(){ showHistory(b.getAttribute('data-hist')); }; });
 
-  if(route==='landing'){ var suGo=$('suGo'); if(suGo) suGo.onclick=doSetup; var remGo=$('remGo'); if(remGo) remGo.onclick=doRemember; }
+  if(route==='landing'){
+    var suGo=$('suGo'); if(suGo) suGo.onclick=doSetup; var remGo=$('remGo'); if(remGo) remGo.onclick=doRemember;
+    var suJoinGo=$('suJoinGo'); if(suJoinGo) suJoinGo.onclick=function(){
+      syncJoin($('suJoinCode').value);
+      var m=$('suJoinMsg'); if(m) m.textContent='Connecting… once the other device\'s data arrives you\'ll see the sign-in screen here automatically.';
+    };
+  }
 
   if(route==='login'){
     LOGIN_FOUND=null;
@@ -1356,6 +1493,10 @@ function wire(route,q){
   }
 
   if(route==='settings'){
+    var syncOnBtn=$('syncOnBtn'); if(syncOnBtn) syncOnBtn.onclick=function(){ syncEnable(); render(); toast('Cloud sync turned on.'); };
+    var syncJoinBtn=$('syncJoinBtn'); if(syncJoinBtn) syncJoinBtn.onclick=function(){ syncJoin($('syncJoinCode').value); render(); toast('Joining — your data will update as it syncs.'); };
+    var syncCopyBtn=$('syncCopyBtn'); if(syncCopyBtn) syncCopyBtn.onclick=function(){ if(navigator.clipboard) navigator.clipboard.writeText(syncCode()).then(function(){toast('Code copied.');}); else toast('Copy not supported on this browser.'); };
+    var syncOffBtn=$('syncOffBtn'); if(syncOffBtn) syncOffBtn.onclick=function(){ if(!confirm('Turn off cloud sync on this device? Your data already here stays, but this device will stop sending/receiving updates.')) return; syncDisable(); render(); toast('Cloud sync turned off on this device.'); };
     if(!isInspector()){
       var setStyleGo=$('setStyleGo'); if(setStyleGo) setStyleGo.onclick=function(){ DATA.settings.style=$('setStyle').value; save(); render(); toast('Style applied.'); };
       var setCCGo=$('setCCGo'); if(setCCGo) setCCGo.onclick=function(){
@@ -1442,6 +1583,7 @@ window.onerror = function(msg){
 window.App = { go: go, logout: doLogout, testNote: function(title,body,admin){ note(CUR_SID,title,body,admin); save(); } };
 load();
 render();
+if(syncOn()) syncInit();
 // Only register a service worker when actually hosted (http/https) — on a
 // file:// page (e.g. the combined single-file build) this is unsupported and
 // browsers reject it outright, so it's skipped there rather than erroring.
