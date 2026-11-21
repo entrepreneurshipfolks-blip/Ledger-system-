@@ -66,64 +66,150 @@ function findAccount(name){
 function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(DATA)); }catch(e){ toast('Could not save — storage may be full.'); } syncSchedulePush(); }
 
 /* ------------------------------------------------------------- cloud sync */
-/* Optional real-time sync across devices, backed by a Firebase project.
+/* Optional sync across devices, backed by a Firebase/Firestore project, done
+   with plain REST calls (fetch + JSON) rather than Google's Firebase SDK —
+   that SDK refuses to load at all on older phone browsers (shows "please
+   update your browser"), while a plain HTTPS request works on almost
+   anything. Updates land within a few seconds rather than instantly.
    Paste your project's config below to turn it on — leave it as null and the
    app behaves exactly as it always has, fully offline, nothing else changes.
    Get this object from: Firebase console → Project settings → your web app. */
-var SYNC_CONFIG = (typeof window!=='undefined' && window.__SYNC_CONFIG_OVERRIDE__) || {
+var SYNC_CONFIG = (typeof window!=='undefined' && window.__SYNC_CONFIG_FORCE_NULL__) ? null :
+  (typeof window!=='undefined' && window.__SYNC_CONFIG_OVERRIDE__) || {
   apiKey: "AIzaSyDE_XYcKt-Zk53NQw5-SU5jwAm4N1O4pBk",
-  authDomain: "ledger-system-22d85.firebaseapp.com",
-  projectId: "ledger-system-22d85",
-  storageBucket: "ledger-system-22d85.firebasestorage.app",
-  messagingSenderId: "524987798345",
-  appId: "1:524987798345:web:ee7c54337a4465c2280098"
+  projectId: "ledger-system-22d85"
 };
 var SYNC_COLLECTIONS = ['schools','students','payments','charges','ledger','staff','activities','actPayments','bursars','inspectors'];
-var syncDb=null, syncUnsubs=[], syncPushTimer=null, syncApplyingRemote=false;
+var SYNC_POLL_MS = 8000;
+var syncPollTimer=null, syncPushTimer=null, syncApplyingRemote=false, syncBusy=false;
 var syncStatus='off'; // 'off' | 'connecting' | 'synced' | 'error'
 
-function syncAvailable(){ return !!(SYNC_CONFIG && SYNC_CONFIG.apiKey && window.firebase && firebase.firestore); }
+function syncAvailable(){ return !!(SYNC_CONFIG && SYNC_CONFIG.apiKey && SYNC_CONFIG.projectId && typeof fetch==='function'); }
 function syncOn(){ return syncAvailable() && !!(DATA.settings && DATA.settings.syncCode); }
 function syncCode(){ return DATA.settings && DATA.settings.syncCode; }
 
-function syncStopListening(){ syncUnsubs.forEach(function(u){ try{ u(); }catch(e){} }); syncUnsubs=[]; }
+/* ---- Firestore REST plumbing: plain JSON over HTTPS, no SDK, no bundler ---- */
+function syncResourceRoot(){ return 'projects/'+SYNC_CONFIG.projectId+'/databases/(default)/documents'; }
+function syncApiBase(){ return 'https://firestore.googleapis.com/v1/'+syncResourceRoot(); }
+function syncDocName(code,col,id){ return syncResourceRoot()+'/syncs/'+code+(col?('/'+col+(id?('/'+id):'')):''); }
+function syncKeyParam(){ return 'key='+encodeURIComponent(SYNC_CONFIG.apiKey); }
+
+function fsEncVal(v){
+  if(v===null||v===undefined) return {nullValue:null};
+  if(typeof v==='boolean') return {booleanValue:v};
+  if(typeof v==='number') return Number.isInteger(v) ? {integerValue:String(v)} : {doubleValue:v};
+  if(typeof v==='string') return {stringValue:v};
+  if(Array.isArray(v)) return {arrayValue:{values:v.map(fsEncVal)}};
+  if(typeof v==='object') return {mapValue:{fields:fsEncObj(v)}};
+  return {stringValue:String(v)};
+}
+function fsEncObj(obj){
+  var out={};
+  Object.keys(obj||{}).forEach(function(k){ if(obj[k]!==undefined) out[k]=fsEncVal(obj[k]); });
+  return out;
+}
+function fsDecVal(v){
+  if(!v) return null;
+  if('nullValue' in v) return null;
+  if('booleanValue' in v) return v.booleanValue;
+  if('integerValue' in v) return parseInt(v.integerValue,10);
+  if('doubleValue' in v) return v.doubleValue;
+  if('stringValue' in v) return v.stringValue;
+  if('timestampValue' in v) return v.timestampValue;
+  if('arrayValue' in v) return (v.arrayValue.values||[]).map(fsDecVal);
+  if('mapValue' in v) return fsDecObj(v.mapValue.fields||{});
+  return null;
+}
+function fsDecObj(fields){
+  var out={};
+  Object.keys(fields||{}).forEach(function(k){ out[k]=fsDecVal(fields[k]); });
+  return out;
+}
+function syncDocIdFromName(name){ var parts=String(name||'').split('/'); return parts[parts.length-1]; }
+
+function syncFetchCollection(code,col){
+  var url=syncApiBase()+'/syncs/'+code+'/'+col+'?'+syncKeyParam()+'&pageSize=1000';
+  function pageFetch(pageUrl, acc){
+    return fetch(pageUrl).then(function(r){ if(!r.ok) throw new Error('fetch '+col+' failed '+r.status); return r.json(); }).then(function(j){
+      (j.documents||[]).forEach(function(d){ acc.push({ id: syncDocIdFromName(d.name), data: fsDecObj(d.fields||{}) }); });
+      if(j.nextPageToken) return pageFetch(url+'&pageToken='+encodeURIComponent(j.nextPageToken), acc);
+      return acc;
+    });
+  }
+  return pageFetch(url, []);
+}
+function syncFetchRoot(code){
+  var url=syncApiBase()+'/syncs/'+code+'?'+syncKeyParam();
+  return fetch(url).then(function(r){
+    if(r.status===404) return null;
+    if(!r.ok) throw new Error('fetch root failed '+r.status);
+    return r.json();
+  }).then(function(j){ return j ? fsDecObj(j.fields||{}) : null; });
+}
+function syncCommit(writes){
+  if(!writes.length) return Promise.resolve();
+  var url=syncApiBase()+':commit?'+syncKeyParam();
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({writes:writes})}).then(function(r){
+    if(!r.ok) throw new Error('commit failed '+r.status);
+    return r.json();
+  });
+}
+
+function syncStopListening(){ clearInterval(syncPollTimer); syncPollTimer=null; }
+
+function syncPollOnce(){
+  if(!syncOn() || syncBusy) return;
+  syncBusy=true;
+  var code=syncCode();
+  var tasks=SYNC_COLLECTIONS.map(function(name){
+    return syncFetchCollection(code,name).then(function(docs){
+      var arr=DATA[name]; if(!Array.isArray(arr)) return false;
+      var any=false;
+      docs.forEach(function(d){
+        var val=d.data; val.id=d.id;
+        var idx=arr.findIndex(function(x){return x.id===d.id;});
+        if(idx>-1){ if(JSON.stringify(arr[idx])!==JSON.stringify(val)){ arr[idx]=val; any=true; } }
+        else { arr.push(val); any=true; }
+      });
+      return any;
+    }).catch(function(){ return false; });
+  });
+  tasks.push(syncFetchRoot(code).then(function(d){
+    if(!d) return false;
+    var any=false;
+    if(d.admin && JSON.stringify(DATA.admin)!==JSON.stringify(Object.assign({},DATA.admin,d.admin))){ Object.assign(DATA.admin,d.admin); any=true; }
+    if(d.settings){
+      var keepCode=DATA.settings.syncCode, keepBackup=DATA.settings.lastBackup;
+      var merged=Object.assign({},DATA.settings,d.settings); merged.syncCode=keepCode; merged.lastBackup=keepBackup;
+      if(JSON.stringify(DATA.settings)!==JSON.stringify(merged)){ DATA.settings=merged; any=true; }
+    }
+    return any;
+  }).catch(function(){ return false; }));
+  syncApplyingRemote=true;
+  Promise.all(tasks).then(function(results){
+    syncApplyingRemote=false; syncBusy=false;
+    var prevStatus=syncStatus;
+    syncStatus='synced';
+    var any=results.some(Boolean);
+    if(any){ save(); render(); }
+    else if(prevStatus!=='synced'){ render(); }
+  }).catch(function(){
+    syncApplyingRemote=false; syncBusy=false; syncStatus='error'; render();
+  });
+}
 
 function syncInit(){
   if(!syncOn()) return;
-  try{
-    if(!firebase.apps.length) firebase.initializeApp(SYNC_CONFIG);
-    syncDb = firebase.firestore();
-  }catch(e){ syncStatus='error'; return; }
   syncStatus='connecting';
   syncStopListening();
-  var root = syncDb.collection('syncs').doc(syncCode());
-  SYNC_COLLECTIONS.forEach(function(name){
-    var unsub = root.collection(name).onSnapshot({includeMetadataChanges:true}, function(snap){
-      syncApplyingRemote=true;
-      var any=false;
-      snap.docChanges().forEach(function(ch){
-        if(ch.doc.metadata.hasPendingWrites) return; // our own just-written doc echoing back — skip only this one
-        any=true;
-        var arr=DATA[name]; if(!Array.isArray(arr)) return;
-        var idx=arr.findIndex(function(x){return x.id===ch.doc.id;});
-        if(ch.type==='removed'){ if(idx>-1) arr.splice(idx,1); }
-        else{ var val=ch.doc.data(); val.id=ch.doc.id; if(idx>-1) arr[idx]=val; else arr.push(val); }
-      });
-      syncApplyingRemote=false;
-      if(any){ syncStatus='synced'; save(); render(); }
-    }, function(){ syncStatus='error'; render(); });
-    syncUnsubs.push(unsub);
-  });
-  var unsubRoot = root.onSnapshot({includeMetadataChanges:true}, function(doc){
-    if(doc.metadata.hasPendingWrites || !doc.exists) return;
-    syncApplyingRemote=true;
-    var d=doc.data()||{};
-    if(d.admin) Object.assign(DATA.admin, d.admin);
-    if(d.settings){ var keepCode=DATA.settings.syncCode, keepBackup=DATA.settings.lastBackup; Object.assign(DATA.settings, d.settings); DATA.settings.syncCode=keepCode; DATA.settings.lastBackup=keepBackup; }
-    syncApplyingRemote=false; syncStatus='synced';
-    save(); render();
-  }, function(){ syncStatus='error'; render(); });
-  syncUnsubs.push(unsubRoot);
+  syncPollOnce();
+  syncPollTimer=setInterval(function(){
+    if(typeof document!=='undefined' && document.hidden) return; // save battery/data while backgrounded
+    syncPollOnce();
+  }, SYNC_POLL_MS);
+}
+if(typeof document!=='undefined'){
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden && syncOn()) syncPollOnce(); });
 }
 
 function syncSchedulePush(){
@@ -132,26 +218,31 @@ function syncSchedulePush(){
   syncPushTimer=setTimeout(syncPushNow, 700);
 }
 function syncPushNow(){
-  if(!syncOn() || !syncDb) return;
-  var root=syncDb.collection('syncs').doc(syncCode());
-  var ops=[]; // {ref, data, merge}
+  if(!syncOn()) return;
+  var code=syncCode();
+  var writes=[];
   SYNC_COLLECTIONS.forEach(function(name){
-    (DATA[name]||[]).forEach(function(item){ if(item && item.id) ops.push({ref:root.collection(name).doc(item.id), data:item}); });
-  });
-  var settingsCopy=Object.assign({},DATA.settings); delete settingsCopy.syncCode;
-  ops.push({ref:root, data:{admin:DATA.admin, settings:settingsCopy, updatedAt:Date.now()}, merge:true});
-  // Firestore batches cap at 500 writes, so a school with a lot of history is
-  // chunked into several sequential batches rather than one big one.
-  var chunks=[]; for(var i=0;i<ops.length;i+=450) chunks.push(ops.slice(i,i+450));
-  var chain=Promise.resolve();
-  chunks.forEach(function(chunk){
-    chain=chain.then(function(){
-      var batch=syncDb.batch();
-      chunk.forEach(function(o){ batch.set(o.ref, o.data, o.merge?{merge:true}:undefined); });
-      return batch.commit();
+    (DATA[name]||[]).forEach(function(item){
+      if(item && item.id) writes.push({update:{name:syncDocName(code,name,item.id), fields:fsEncObj(item)}});
     });
   });
-  chain.then(function(){ syncStatus='synced'; }).catch(function(){ syncStatus='error'; });
+  var settingsCopy=Object.assign({},DATA.settings); delete settingsCopy.syncCode;
+  writes.push({
+    update:{name:syncDocName(code), fields:fsEncObj({admin:DATA.admin, settings:settingsCopy, updatedAt:Date.now()})},
+    updateMask:{fieldPaths:['admin','settings','updatedAt']}
+  });
+  // Firestore commits cap at 500 writes, so a school with a lot of history is
+  // chunked into several sequential requests rather than one big one.
+  var chunks=[]; for(var i=0;i<writes.length;i+=450) chunks.push(writes.slice(i,i+450));
+  var chain=Promise.resolve();
+  chunks.forEach(function(chunk){ chain=chain.then(function(){ return syncCommit(chunk); }); });
+  chain.then(function(){
+    var prevStatus=syncStatus; syncStatus='synced';
+    if(prevStatus!=='synced') render();
+  }).catch(function(){
+    var prevStatus=syncStatus; syncStatus='error';
+    if(prevStatus!=='error') render();
+  });
 }
 function syncGenerateCode(){ return b2hex(crypto.getRandomValues(new Uint8Array(10))); }
 function syncEnable(){
@@ -180,7 +271,7 @@ function cloudSyncSectionHtml(){
     var st={connecting:'Connecting…',synced:'Synced ✓',error:'Connection problem — will retry',off:'Off'}[syncStatus]||'Off';
     out += '<div class="it"><span class="mu">Status</span><b>'+esc(st)+'</b></div>'+
       '<div class="it"><span class="mu">Sync code</span><b style="font-family:monospace">'+esc(syncCode())+'</b></div>'+
-      '<p class="mu">Share this code with your other devices or staff — anyone who enters it (Settings → Cloud sync → Join) sees and edits the same live data.</p>';
+      '<p class="mu">Share this code with your other devices or staff — anyone who enters it (Settings → Cloud sync → Join) sees and edits the same data, updated every few seconds.</p>';
     if(!isInspector()){
       out += '<button id="syncCopyBtn">Copy code</button> '+
         '<a class="btn" href="https://wa.me/?text='+encodeURIComponent('Join our ledger\'s cloud sync — open the app, go to Settings → Cloud sync → Join, and enter this code: '+syncCode())+'" target="_blank">Share via WhatsApp</a> '+
